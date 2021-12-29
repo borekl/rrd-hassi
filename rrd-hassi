@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+
+# Utility for graphing Home Assistant managed sensors with RRDtool.
+
+use warnings;
+use strict;
+use experimental 'signatures', 'postderef';
+use utf8;
+
+use RRDTool::OO;
+use FindBin qw($Bin);
+use Path::Tiny;
+use POSIX qw(strftime);
+use Mojo::JSON qw(decode_json);
+use Mojo::IOLoop;
+use Mojo::UserAgent;
+use Mojo::Template;
+use Mojo::Loader qw(data_section);
+use Encode qw(encode);
+use POSIX qw(strftime);
+
+#------------------------------------------------------------------------------
+# turn a pathname into a Path::Tiny instance and make sure it exists
+sub get_location ($dir)
+{
+  my $path = path($Bin);
+
+  # return default path if no argument
+  return $path if !$dir;
+
+  # get absolute/relative path if argument is specified
+  if(path($dir)->is_absolute) {
+    $path = path($dir);
+  } else {
+    $path = $path->child($dir);
+  }
+
+  # ensure the resulting path's existence
+  die "Directory $path does not exist" unless $path->exists;
+
+  # finish
+  return $path;
+}
+
+# read configuration
+my $cfg_file = get_location('rrd-hassi.json');
+my $cfg = decode_json($cfg_file->slurp_raw);
+
+# make sure some sources are defined
+my @sources = keys $cfg->{sources}->%* if exists $cfg->{sources};
+die 'No sources defined' if !@sources;
+
+# prepare for reading the data
+my $ua = Mojo::UserAgent->new;
+my %sensor_data;
+my $count_of_responses = 0;
+my $url = $cfg->{config}{hassi}{url} or die 'No HA URL defined';
+my $token = $cfg->{config}{hassi}{token} or die 'No HA auth token defined';
+
+# iterate over sources and read them in parallel
+foreach my $s (@sources) {
+  my $src = $cfg->{sources}{$s};
+
+  # prepare HTTP GET request with authorization header
+  my $tx = $ua->build_tx(
+    'GET', $url . $src->{sensor}, { Authorization => "Bearer $token" }
+  );
+
+  # issue the request in a non-blocking way; we count the responses and when
+  # we receive all of them, we stop the event loop
+  $ua->start($tx => sub ($ua, $tx) {
+    if($tx->result->code == 200) {
+      $sensor_data{$s} = $tx->result->json;
+      $count_of_responses++;
+      Mojo::IOLoop->stop if $count_of_responses == @sources;
+    }
+  });
+
+}
+
+# start the event loop so the queued requests can be dispatched; FIXME:
+# we need to use set timeout, otherwise stuck request will make this hang
+# forever
+Mojo::IOLoop->start;
+
+# iterate over sources and handle RRD creation and updating
+my $rrdpath = get_location($cfg->{config}{rrddir});
+my @rrddef = grep { !/^#/ } $cfg->{rrd}->@*;
+my $dst = get_location($cfg->{config}{dstdir});
+my $rrd;
+
+foreach my $s (@sources) {
+  my $src = $cfg->{sources}{$s} // die "Undefined source '$s'";
+
+  # source definition
+  my %rrdsrc = ( name => $s, type => 'GAUGE' );
+
+  # get RRD file
+  my $rrdfile = $rrdpath->child("$s.rrd");
+  $rrd = RRDTool::OO->new(file => $rrdfile->canonpath);
+
+  # create a new RRD database if it does not exist
+  $rrd->create(@rrddef, data_source => \%rrdsrc) unless $rrdfile->exists;
+
+  # get particular source's data, skip if missing
+  next unless my $sd = $sensor_data{$s};
+
+  # update RRD
+  $rrd->update($sensor_data{$s}{state});
+
+}
+
+# add '--right-axis' option
+$rrd->option_add('graph', 'right_axis');
+
+# time spans
+my %spans = (
+  day => 86400, week => 86400*7, month => 86400*30, year => 86400*365
+);
+
+# generate graphs
+foreach my $graph (keys $cfg->{graphs}->%*) {
+  foreach my $span (keys %spans) {
+    $rrd->graph(
+      image => $dst->child("$graph.$span.png")->stringify,
+      start => (time() - $spans{$span}),
+      end => time(),
+      lower_limit => $cfg->{graphs}{$graph}{limits}[0],
+      upper_limit => $cfg->{graphs}{$graph}{limits}[1],
+      width => $cfg->{config}{img_w},
+      height => $cfg->{config}{img_h},
+      right_axis => '1:0',
+      ( map {
+        my $id = $cfg->{sources}{$_}{name};
+        ( draw => {
+          file => $rrdpath->child("$_.rrd")->stringify,
+          dsname => $_,
+          color => $cfg->{sources}{$_}{color},
+          legend => $cfg->{sources}{$_}{label},
+          type => 'line',
+          thickness => 2,
+        } )
+      } $cfg->{graphs}{$graph}{sources}->@*)
+    );
+  }
+}
+
+# create index pages
+my $mt = Mojo::Template->new->vars(1);
+my $htmldir = get_location($cfg->{config}{dstdir});
+$mt->parse(data_section('main', 'index.html.ep'));
+my $gentime = strftime('%c', localtime());
+
+foreach my $graph (keys $cfg->{graphs}->%*) {
+  $htmldir->child("$graph.html")->spew(encode('UTF-8', $mt->process({
+    title => $cfg->{graphs}{$graph}{title},
+    base => $graph,
+    gentime => $gentime
+  })));
+}
+
+__DATA__
+
+@@index.html.ep
+
+<!doctype html>
+
+<html>
+
+<head>
+  <title><%= $title %></title>
+  <style>
+    .bold { font-weight: bold; }
+  </style>
+</head>
+
+<body>
+  <h1><%= $title %></h1>
+
+<p><span class="bold">Posledních 24 hodin</span><br>
+<img src="<%= $base %>.day.png"></p>
+
+<p><span class="bold">Poslední týden</span><br>
+<img src="<%= $base %>.week.png"></p>
+
+<p><span class="bold">Poslední měsíc</span><br>
+<img src="<%= $base %>.month.png"></p>
+
+<p><span class="bold">Poslední rok</span><br>
+<img src="<%= $base %>.year.png"></p>
+
+<%= $gentime %>
+
+</body>
+
+</html>

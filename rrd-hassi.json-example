@@ -1,0 +1,82 @@
+{
+
+  "config": {
+    "rrddir": "rrd",
+    "dstdir": "html",
+    "img_w": 800,
+    "img_h": 160,
+    "hassi": {
+      "token": "TOKEN_GOES_HERE",
+      "url": "http://192.168.0.15:8123/api/states/"
+    }
+  },
+
+  "sources": {
+    "balkon0": {
+      "sensor": "sensor.multi_sensor",
+      "label": "Balkon",
+      "color": "00CC00"
+    },
+    "kuchyn0": {
+      "sensor": "sensor.temperature_10",
+      "label": "Kuchyň",
+      "color": "00CCCC"
+    },
+    "pokoj0": {
+      "sensor": "sensor.temperature_4",
+      "label": "Pokoj",
+      "color": "3333FF"
+    },
+    "obyvak0": {
+      "sensor": "sensor.temperature_13",
+      "label": "Obývák",
+      "color": "CC00CC"
+    },
+    "loznice0": {
+      "sensor": "sensor.temperature_7",
+      "label": "Ložnice",
+      "color": "AACC00"
+    }
+  },
+
+  "graphs": {
+    "vnitrni": {
+      "title": "Vnitřní teploty",
+      "limits": [ 10, 30 ],
+      "sources": [ "kuchyn0", "loznice0", "obyvak0", "pokoj0" ]
+    },
+    "venkovni": {
+      "title": "Venkovní teploty",
+      "limits": [ -10, 30 ],
+      "sources": [ "balkon0" ]
+    }
+  },
+
+  "rrd": [
+    "step", 300,
+    "#--- 1 week at 5 minute interval",
+    "archive", {
+      "cpoints": 1,
+      "rows": 2016
+    },
+    "#--- 1 month at 10 minute interval",
+    "archive", {
+      "cpoints": 2,
+      "rows": 4320,
+      "cfunc": "AVERAGE"
+    },
+    "#--- 1 year at 1 hour interval",
+    "archive", {
+      "cpoints": 24,
+      "rows": 4380,
+      "cfunc": "AVERAGE"
+    },
+    "#--- 10 years at 1 day interval",
+    "archive", {
+      "cpoints": 288,
+      "rows": 3650,
+      "cfunc": "AVERAGE"
+    }
+  ]
+
+}
